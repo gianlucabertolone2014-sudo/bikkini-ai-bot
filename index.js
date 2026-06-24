@@ -1,0 +1,121 @@
+require('dotenv').config();
+const { Client, GatewayIntentBits } = require('discord.js');
+const Groq = require('groq-sdk');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
+});
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+const conversations = new Map();
+
+const SYSTEM_PROMPT = `You are Bikkini AI, a cool and helpful Discord bot assistant.
+Your name is Bikkini AI and you were created for this Discord server.
+You are friendly, helpful, and a little funny sometimes.
+VERY IMPORTANT: Always detect the language the user is writing in and respond in that EXACT same language.
+If they write in Turkish, respond in Turkish. If German, respond in German. If English, respond in English. And so on.
+Keep responses concise and to the point - this is Discord, not an essay.`;
+
+async function handleAI(message, prompt) {
+  if (!prompt) {
+    return message.reply('❓ Schreib etwas nach `?ai` — zum Beispiel: `?ai wie geht es dir?`');
+  }
+
+  const userId = message.author.id;
+  await message.channel.sendTyping();
+
+  if (!conversations.has(userId)) conversations.set(userId, []);
+  const history = conversations.get(userId);
+
+  history.push({ role: 'user', content: prompt });
+  if (history.length > 10) history.splice(0, history.length - 10);
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...history
+      ],
+      max_tokens: 1024
+    });
+
+    const reply = response.choices[0].message.content;
+    history.push({ role: 'assistant', content: reply });
+
+    if (reply.length <= 1900) {
+      await message.reply(reply);
+    } else {
+      const chunks = reply.match(/.{1,1900}/gs);
+      for (const chunk of chunks) {
+        await message.channel.send(chunk);
+      }
+    }
+  } catch (err) {
+    console.error('[AI ERROR]', err);
+    await message.reply('❌ Something went wrong. Please try again.');
+  }
+}
+
+function handleHelp(message) {
+  message.reply([
+    '**🤖 Bikkini AI – Commands**',
+    '',
+    '`?ai <frage>` – Frag Bikkini AI alles (antwortet in deiner Sprache!)',
+    '`?reset` – Gesprächsverlauf zurücksetzen',
+    '`?help` – Diese Hilfe anzeigen',
+    '`?info` – Info über Bikkini AI',
+    '',
+    '**Beispiele:**',
+    '`?ai wie geht es dir?`',
+    '`?ai nasıl yapılır?`',
+    '`?ai how do I make a Discord bot?`'
+  ].join('\n'));
+}
+
+function handleInfo(message) {
+  message.reply([
+    '**🌊 Bikkini AI**',
+    '',
+    '> Ich bin Bikkini AI, dein intelligenter Discord Assistent!',
+    '> Ich verstehe und antworte in **jeder Sprache**.',
+    '> Ich merke mir dein Gespräch für Folgefragen.',
+    '',
+    `**Server:** ${message.guild.name}`,
+    `**Powered by:** Groq AI (Llama 3)`,
+    `**Prefix:** \`?\``
+  ].join('\n'));
+}
+
+function handleReset(message) {
+  conversations.delete(message.author.id);
+  message.reply('🔄 Dein Gesprächsverlauf wurde zurückgesetzt! Starte neu mit `?ai`.');
+}
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('?')) return;
+
+  const args = message.content.slice(1).trim().split(/ +/);
+  const command = args.shift().toLowerCase();
+  const rest = args.join(' ');
+
+  switch (command) {
+    case 'ai': await handleAI(message, rest); break;
+    case 'help': handleHelp(message); break;
+    case 'info': handleInfo(message); break;
+    case 'reset': handleReset(message); break;
+  }
+});
+
+client.once('ready', () => {
+  console.log(`✅ Bikkini AI is online as: ${client.user.tag}`);
+  client.user.setActivity('?ai | Bikkini AI', { type: 3 });
+});
+
+client.login(process.env.DISCORD_TOKEN);
