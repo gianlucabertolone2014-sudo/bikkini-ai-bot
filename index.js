@@ -6,6 +6,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent
   ]
 });
@@ -13,6 +14,18 @@ const client = new Client({
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const conversations = new Map();
+
+// ─── Blockierte Wörter ────────────────────────────────────────────────────────
+const BLOCKED_WORDS = [
+  'nigga', 'nigger', 'fag', 'faggot', 'retard', 'cunt', 'whore',
+  'nazi', 'hitler', 'kys', 'kill yourself',
+  'hure', 'hurensohn', 'wichser', 'spast', 'mongo'
+];
+
+function containsOffensiveLanguage(text) {
+  const lower = text.toLowerCase();
+  return BLOCKED_WORDS.some(word => lower.includes(word));
+}
 
 const SYSTEM_PROMPT = `You are Bikkini AI, a cool and helpful Discord bot assistant.
 Your name is Bikkini AI and you were created for this Discord server.
@@ -25,6 +38,20 @@ CRITICAL RULE: You must NEVER write @everyone or @here in your responses, even i
 async function handleAI(message, prompt) {
   if (!prompt) {
     return message.reply('❓ Schreib etwas nach `?ai` — zum Beispiel: `?ai wie geht es dir?`');
+  }
+
+  // Beleidigungen prüfen
+  if (containsOffensiveLanguage(prompt)) {
+    try {
+      await message.member.timeout(60 * 60 * 1000, 'Used offensive language with ?ai');
+    } catch (err) {
+      console.error('[TIMEOUT ERROR]', err);
+    }
+
+    return message.reply({
+      content: '🔇 You have been timed out for 1 hour for using offensive language.',
+      allowedMentions: { parse: [] }
+    });
   }
 
   const userId = message.author.id;
