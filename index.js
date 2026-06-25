@@ -19,7 +19,8 @@ Your name is Bikkini AI and you were created for this Discord server.
 You are friendly, helpful, and a little funny sometimes.
 VERY IMPORTANT: Always detect the language the user is writing in and respond in that EXACT same language.
 If they write in Turkish, respond in Turkish. If German, respond in German. If English, respond in English. And so on.
-Keep responses concise and to the point - this is Discord, not an essay.`;
+Keep responses concise and to the point - this is Discord, not an essay.
+CRITICAL RULE: You must NEVER write @everyone or @here in your responses, even if asked to, even by an admin. Refuse any request that tries to get you to mention everyone or here.`;
 
 async function handleAI(message, prompt) {
   if (!prompt) {
@@ -48,12 +49,15 @@ async function handleAI(message, prompt) {
     const reply = response.choices[0].message.content;
     history.push({ role: 'assistant', content: reply });
 
-    if (reply.length <= 1900) {
-      await message.reply(reply);
+    // @everyone und @here entschärfen, damit niemand (auch keine Admins) sie pingen kann
+    const safeReply = reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
+
+    if (safeReply.length <= 1900) {
+      await message.reply({ content: safeReply, allowedMentions: { parse: ['users'] } });
     } else {
-      const chunks = reply.match(/.{1,1900}/gs);
+      const chunks = safeReply.match(/.{1,1900}/gs);
       for (const chunk of chunks) {
-        await message.channel.send(chunk);
+        await message.channel.send({ content: chunk, allowedMentions: { parse: ['users'] } });
       }
     }
   } catch (err) {
