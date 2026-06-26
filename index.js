@@ -17,6 +17,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversations = new Map();
 const SETTINGS_FILE = './member_settings.json';
 const ADMIN_SETTINGS_FILE = './admin_settings.json';
+const OFFENSES_FILE = './offenses.json';
 // Pending ping confirmations: channelId -> { pingType, content, requestedBy }
 const pendingPings = new Map();
 // Pending mod action waiting for user select: userId -> { action }
@@ -60,6 +61,21 @@ const BLOCKED_WORDS = [
 ];
 function containsOffensiveLanguage(text) {
   return BLOCKED_WORDS.some(word => text.toLowerCase().includes(word));
+}
+
+// ─── Offense tracking (3 strikes = ban) ───────────────────────────────────────
+function loadOffenses() {
+  if (!fs.existsSync(OFFENSES_FILE)) return {};
+  return JSON.parse(fs.readFileSync(OFFENSES_FILE, 'utf8'));
+}
+function saveOffenses(data) {
+  fs.writeFileSync(OFFENSES_FILE, JSON.stringify(data, null, 2));
+}
+function addOffense(userId) {
+  const offenses = loadOffenses();
+  offenses[userId] = (offenses[userId] || 0) + 1;
+  saveOffenses(offenses);
+  return offenses[userId];
 }
 
 const MOD_ACTION_WORDS = ['ban', 'kick', 'timeout', 'mute', 'unban', 'unmute'];
@@ -156,8 +172,26 @@ async function handleAI(message, prompt) {
   }
 
   if (containsOffensiveLanguage(prompt)) {
+    const offenseCount = addOffense(message.author.id);
+
+    if (offenseCount >= 3) {
+      try {
+        await message.member.ban({ reason: 'Used offensive language with ?ai 3 times' });
+        return message.reply({
+          content: `🔨 **${message.author.tag}** has been **banned** for repeatedly using offensive language (3rd offense).`,
+          allowedMentions: { parse: [] }
+        });
+      } catch (err) {
+        console.error('[BAN ERROR]', err);
+        return message.reply({ content: '❌ Tried to ban you for repeated offenses but could not (check my permissions).', allowedMentions: { parse: [] } });
+      }
+    }
+
     try { await message.member.timeout(60 * 60 * 1000, 'Used offensive language with ?ai'); } catch {}
-    return message.reply({ content: '🔇 You have been timed out for 1 hour for using offensive language.', allowedMentions: { parse: [] } });
+    return message.reply({
+      content: `🔇 You have been timed out for 1 hour for using offensive language. **Warning ${offenseCount}/3** — on your 3rd offense you will be banned.`,
+      allowedMentions: { parse: [] }
+    });
   }
 
   // Everyone/here ping request
