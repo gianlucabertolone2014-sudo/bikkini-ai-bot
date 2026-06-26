@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const Groq = require('groq-sdk');
 const fs = require('fs');
 
@@ -17,21 +17,18 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversations = new Map();
 const SETTINGS_FILE = './member_settings.json';
 const ADMIN_SETTINGS_FILE = './admin_settings.json';
-// Speichert pending everyone/here ping requests: messageId -> { channelId, content, requestedBy }
+// Pending ping confirmations: channelId -> { pingType, content, requestedBy }
 const pendingPings = new Map();
+// Pending mod action waiting for user select: userId -> { action }
+const pendingModSelections = new Map();
 
 // ─── Member Settings ────────────────────────────────────────────────────────────
 function loadSettings() {
   if (!fs.existsSync(SETTINGS_FILE)) return {};
   return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
 }
-function saveSettings(data) {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2));
-}
-function getUserLanguage(userId) {
-  const settings = loadSettings();
-  return settings[userId]?.language || null;
-}
+function saveSettings(data) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2)); }
+function getUserLanguage(userId) { return loadSettings()[userId]?.language || null; }
 function setUserLanguage(userId, language) {
   const settings = loadSettings();
   if (!settings[userId]) settings[userId] = {};
@@ -41,12 +38,14 @@ function setUserLanguage(userId, language) {
 
 // ─── Admin Settings ─────────────────────────────────────────────────────────────
 function loadAdminSettings() {
-  if (!fs.existsSync(ADMIN_SETTINGS_FILE)) return { aiOnline: true, modCommandsEnabled: false };
-  return JSON.parse(fs.readFileSync(ADMIN_SETTINGS_FILE, 'utf8'));
+  if (!fs.existsSync(ADMIN_SETTINGS_FILE)) {
+    return { aiOnline: true, modPermissions: { ban: false, kick: false, timeout: false, mute: false } };
+  }
+  const data = JSON.parse(fs.readFileSync(ADMIN_SETTINGS_FILE, 'utf8'));
+  if (!data.modPermissions) data.modPermissions = { ban: false, kick: false, timeout: false, mute: false };
+  return data;
 }
-function saveAdminSettings(data) {
-  fs.writeFileSync(ADMIN_SETTINGS_FILE, JSON.stringify(data, null, 2));
-}
+function saveAdminSettings(data) { fs.writeFileSync(ADMIN_SETTINGS_FILE, JSON.stringify(data, null, 2)); }
 function isAdmin(userId) {
   return process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()).includes(userId) : false;
 }
@@ -60,8 +59,7 @@ const BLOCKED_WORDS = [
   'asshole', 'dumbass', 'bastard', 'piece of shit', 'son of a bitch'
 ];
 function containsOffensiveLanguage(text) {
-  const lower = text.toLowerCase();
-  return BLOCKED_WORDS.some(word => lower.includes(word));
+  return BLOCKED_WORDS.some(word => text.toLowerCase().includes(word));
 }
 
 const MOD_ACTION_WORDS = ['ban', 'kick', 'timeout', 'mute', 'unban', 'unmute'];
@@ -75,8 +73,7 @@ function getModAction(text) {
   return null;
 }
 function containsPingWord(text) {
-  const lower = text.toLowerCase();
-  return PING_WORDS.some(word => lower.includes(word));
+  return PING_WORDS.some(word => text.toLowerCase().includes(word));
 }
 function extractPingType(text) {
   const lower = text.toLowerCase();
@@ -94,36 +91,35 @@ function extractUserId(text) {
   return match ? match[1] : null;
 }
 
-// ─── Execute real mod action ───────────────────────────────────────────────────
-async function executeModAction(message, action, prompt) {
-  const targetId = extractUserId(prompt);
-  if (!targetId) return message.reply('❌ Please mention the user you want to apply this action to.');
+const ACTION_TO_PERMISSION = { ban: 'ban', kick: 'kick', timeout: 'timeout', mute: 'mute', unban: 'ban', unmute: 'mute' };
 
-  const reason = prompt.replace(/<@!?\d+>/, '').trim() || `Action requested via Bikkini AI by ${message.author.tag}`;
+async function executeModAction(context, action, targetId, reason) {
+  const guild = context.guild;
+  const send = (content) => context.channel ? context.channel.send(content) : context.followUp(content);
 
   try {
-    const member = await message.guild.members.fetch(targetId);
+    const member = await guild.members.fetch(targetId);
     switch (action) {
       case 'ban':
         await member.ban({ reason });
-        return message.reply(`✅ <@${targetId}> has been **banned**.\n**Reason:** ${reason}`);
+        return send(`✅ <@${targetId}> has been **banned**.\n**Reason:** ${reason}`);
       case 'kick':
         await member.kick(reason);
-        return message.reply(`✅ <@${targetId}> has been **kicked**.\n**Reason:** ${reason}`);
+        return send(`✅ <@${targetId}> has been **kicked**.\n**Reason:** ${reason}`);
       case 'timeout':
       case 'mute':
         await member.timeout(60 * 60 * 1000, reason);
-        return message.reply(`✅ <@${targetId}> has been **timed out for 1 hour**.\n**Reason:** ${reason}`);
+        return send(`✅ <@${targetId}> has been **timed out for 1 hour**.\n**Reason:** ${reason}`);
       case 'unban':
-        await message.guild.members.unban(targetId, reason);
-        return message.reply(`✅ <@${targetId}> has been **unbanned**.`);
+        await guild.members.unban(targetId, reason);
+        return send(`✅ <@${targetId}> has been **unbanned**.`);
       case 'unmute':
         await member.timeout(null);
-        return message.reply(`✅ <@${targetId}> has been **unmuted**.`);
+        return send(`✅ <@${targetId}> has been **unmuted**.`);
     }
   } catch (err) {
     console.error('[MOD ACTION ERROR]', err);
-    return message.reply('❌ Could not perform this action. Check my permissions and role position.');
+    return send('❌ Could not perform this action. Check my permissions and role position.');
   }
 }
 
@@ -134,6 +130,27 @@ async function handleAI(message, prompt) {
   if (!adminSettings.aiOnline) {
     return message.reply({ content: '🔴 Bikkini AI is currently offline (turned off by an Admin).', allowedMentions: { parse: [] } });
   }
+
+  // ?ai confirm - admin confirms a pending ping
+  if (prompt.trim().toLowerCase() === 'confirm') {
+    if (!isAdmin(message.author.id)) {
+      return message.reply({ content: '❌ Only admins can confirm pings.', allowedMentions: { parse: [] } });
+    }
+
+    const pending = pendingPings.get(message.channel.id);
+    if (!pending) {
+      return message.reply('❌ There is no pending ping to confirm in this channel.');
+    }
+
+    const mention = pending.pingType === 'everyone' ? '@everyone' : '@here';
+    pendingPings.delete(message.channel.id);
+
+    return message.channel.send({
+      content: `${mention} ${pending.content}`,
+      allowedMentions: { parse: ['everyone'] }
+    });
+  }
+
   if (!prompt) {
     return message.reply('❓ Please write something after `?ai` — for example: `?ai how are you?`');
   }
@@ -151,38 +168,51 @@ async function handleAI(message, prompt) {
       return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
     }
 
-    // Admin requested a ping - show confirm button
     const pingContent = prompt.replace(/@?everyone/gi, '').replace(/@?here/gi, '').trim();
 
-    const confirmMsg = await message.reply({
-      embeds: [new EmbedBuilder()
-        .setColor(0xe67e22)
-        .setTitle('⚠️ Confirm Ping')
-        .setDescription(`You are about to ping **@${pingType}**.\n\n**Message:** ${pingContent || '(no extra message)'}\n\nAre you sure?`)],
-      components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`confirmping_${pingType}`).setLabel('✅ Confirm').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('cancelping').setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
-      )]
-    });
-
-    pendingPings.set(confirmMsg.id, {
-      channelId: message.channel.id,
+    pendingPings.set(message.channel.id, {
       pingType,
       content: pingContent,
       requestedBy: message.author.id
     });
-    return;
+
+    return message.reply({
+      content: `⏳ Wait for an Admin to confirm to ping @${pingType}. An admin can type \`?ai confirm\` to send it.`,
+      allowedMentions: { parse: [] }
+    });
   }
 
+  // Mod action request
   const modAction = getModAction(prompt);
   if (modAction) {
     if (!isAdmin(message.author.id)) {
       return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
     }
-    if (!adminSettings.modCommandsEnabled) {
-      return message.reply('⚠️ Mod commands via Bikkini AI are currently **disabled**. An admin can enable them in `?ai adminsettings`.');
+
+    const permKey = ACTION_TO_PERMISSION[modAction];
+    if (!adminSettings.modPermissions[permKey]) {
+      return message.reply(`⚠️ The **${modAction}** command is currently **disabled**. Enable it with \`?ai adminsettings\`.`);
     }
-    return await executeModAction(message, modAction, prompt.slice(modAction.length).trim());
+
+    const rest = prompt.slice(modAction.length).trim();
+    const targetId = extractUserId(rest);
+
+    if (targetId) {
+      // User was mentioned directly - execute right away
+      const reason = rest.replace(/<@!?\d+>/, '').trim() || `Action requested via Bikkini AI by ${message.author.tag}`;
+      return await executeModAction(message, modAction, targetId, reason);
+    }
+
+    // No user mentioned - show a user select menu
+    pendingModSelections.set(message.author.id, { action: modAction, reason: rest || `Action requested via Bikkini AI by ${message.author.tag}` });
+
+    const row = new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder()
+        .setCustomId('modaction_userselect')
+        .setPlaceholder(`Select a user to ${modAction}`)
+    );
+
+    return message.reply({ content: `Select the user you want to **${modAction}**:`, components: [row] });
   }
 
   const userId = message.author.id;
@@ -255,13 +285,17 @@ async function handleAdminSettings(message) {
   }
 
   const settings = loadAdminSettings();
+  const mp = settings.modPermissions;
 
   const embed = new EmbedBuilder()
     .setColor(0x3498db)
     .setTitle('🛠️ Admin Settings')
     .addFields(
       { name: 'AI Status', value: settings.aiOnline ? '🟢 Online' : '🔴 Offline', inline: true },
-      { name: 'Mod Commands', value: settings.modCommandsEnabled ? '✅ Enabled' : '❌ Disabled', inline: true }
+      { name: 'Ban', value: mp.ban ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Kick', value: mp.kick ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Timeout', value: mp.timeout ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Mute', value: mp.mute ? '✅ Enabled' : '❌ Disabled', inline: true }
     )
     .setDescription('Use the menu below to change settings.');
 
@@ -270,10 +304,16 @@ async function handleAdminSettings(message) {
       .setCustomId('adminsettings_menu')
       .setPlaceholder('Choose a setting to change')
       .addOptions([
-        { label: 'AI: Online', description: 'Turn Bikkini AI on', value: 'ai_online', emoji: '🟢' },
-        { label: 'AI: Offline', description: 'Turn Bikkini AI off', value: 'ai_offline', emoji: '🔴' },
-        { label: 'Mod Commands: Enable', description: 'Allow ban/kick/timeout via AI', value: 'mod_on', emoji: '✅' },
-        { label: 'Mod Commands: Disable', description: 'Disable ban/kick/timeout via AI', value: 'mod_off', emoji: '❌' }
+        { label: 'AI: Online', value: 'ai_online', emoji: '🟢' },
+        { label: 'AI: Offline', value: 'ai_offline', emoji: '🔴' },
+        { label: 'Ban: Enable', value: 'ban_on', emoji: '✅' },
+        { label: 'Ban: Disable', value: 'ban_off', emoji: '❌' },
+        { label: 'Kick: Enable', value: 'kick_on', emoji: '✅' },
+        { label: 'Kick: Disable', value: 'kick_off', emoji: '❌' },
+        { label: 'Timeout: Enable', value: 'timeout_on', emoji: '✅' },
+        { label: 'Timeout: Disable', value: 'timeout_off', emoji: '❌' },
+        { label: 'Mute: Enable', value: 'mute_on', emoji: '✅' },
+        { label: 'Mute: Disable', value: 'mute_off', emoji: '❌' }
       ])
   );
 
@@ -329,7 +369,7 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// ─── Interactions (Select Menus, Buttons, Modals) ──────────────────────────────
+// ─── Interactions ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
 
   // ── Member Settings Select Menu ───────────────────────────────────────────
@@ -365,26 +405,22 @@ client.on('interactionCreate', async (interaction) => {
     const choice = interaction.values[0];
     const settings = loadAdminSettings();
 
-    if (choice === 'ai_online') {
-      settings.aiOnline = true;
-      saveAdminSettings(settings);
-      return await interaction.reply({ content: '🟢 Bikkini AI is now **online**.', ephemeral: true });
-    }
-    if (choice === 'ai_offline') {
-      settings.aiOnline = false;
-      saveAdminSettings(settings);
-      return await interaction.reply({ content: '🔴 Bikkini AI is now **offline**.', ephemeral: true });
-    }
-    if (choice === 'mod_on') {
-      settings.modCommandsEnabled = true;
-      saveAdminSettings(settings);
-      return await interaction.reply({ content: '✅ Mod commands **enabled**.', ephemeral: true });
-    }
-    if (choice === 'mod_off') {
-      settings.modCommandsEnabled = false;
-      saveAdminSettings(settings);
-      return await interaction.reply({ content: '❌ Mod commands **disabled**.', ephemeral: true });
-    }
+    const map = {
+      ai_online: () => { settings.aiOnline = true; return '🟢 Bikkini AI is now **online**.'; },
+      ai_offline: () => { settings.aiOnline = false; return '🔴 Bikkini AI is now **offline**.'; },
+      ban_on: () => { settings.modPermissions.ban = true; return '✅ **Ban** command enabled.'; },
+      ban_off: () => { settings.modPermissions.ban = false; return '❌ **Ban** command disabled.'; },
+      kick_on: () => { settings.modPermissions.kick = true; return '✅ **Kick** command enabled.'; },
+      kick_off: () => { settings.modPermissions.kick = false; return '❌ **Kick** command disabled.'; },
+      timeout_on: () => { settings.modPermissions.timeout = true; return '✅ **Timeout** command enabled.'; },
+      timeout_off: () => { settings.modPermissions.timeout = false; return '❌ **Timeout** command disabled.'; },
+      mute_on: () => { settings.modPermissions.mute = true; return '✅ **Mute** command enabled.'; },
+      mute_off: () => { settings.modPermissions.mute = false; return '❌ **Mute** command disabled.'; }
+    };
+
+    const msg = map[choice] ? map[choice]() : '❌ Unknown option.';
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: msg, ephemeral: true });
   }
 
   // ── Language Modal Submit ─────────────────────────────────────────────────
@@ -394,38 +430,18 @@ client.on('interactionCreate', async (interaction) => {
     return await interaction.reply({ content: `✅ Your language has been set to **${language}**!`, ephemeral: true });
   }
 
-  // ── Ping Confirm/Cancel Buttons ───────────────────────────────────────────
-  if (interaction.isButton()) {
-    if (interaction.customId === 'cancelping') {
-      pendingPings.delete(interaction.message.id);
-      return await interaction.update({ content: '❌ Ping cancelled.', embeds: [], components: [] });
+  // ── Mod Action User Select ────────────────────────────────────────────────
+  if (interaction.isUserSelectMenu() && interaction.customId === 'modaction_userselect') {
+    const pending = pendingModSelections.get(interaction.user.id);
+    if (!pending) {
+      return await interaction.reply({ content: '❌ This request has expired.', ephemeral: true });
     }
 
-    if (interaction.customId.startsWith('confirmping_')) {
-      const pending = pendingPings.get(interaction.message.id);
-      if (!pending) {
-        return await interaction.update({ content: '❌ This request has expired.', embeds: [], components: [] });
-      }
+    const targetId = interaction.values[0];
+    pendingModSelections.delete(interaction.user.id);
 
-      if (interaction.user.id !== pending.requestedBy && !isAdmin(interaction.user.id)) {
-        return await interaction.reply({ content: '❌ Only the requester or an admin can confirm this.', ephemeral: true });
-      }
-
-      const pingType = pending.pingType;
-      const mention = pingType === 'everyone' ? '@everyone' : '@here';
-
-      await interaction.update({ content: '✅ Confirmed! Sending ping...', embeds: [], components: [] });
-
-      const channel = client.channels.cache.get(pending.channelId);
-      if (channel) {
-        await channel.send({
-          content: `${mention} ${pending.content}`,
-          allowedMentions: { parse: [pingType === 'everyone' ? 'everyone' : 'everyone'] }
-        });
-      }
-
-      pendingPings.delete(interaction.message.id);
-    }
+    await interaction.update({ content: `Processing **${pending.action}** on <@${targetId}>...`, components: [] });
+    await executeModAction(interaction, pending.action, targetId, pending.reason);
   }
 });
 
