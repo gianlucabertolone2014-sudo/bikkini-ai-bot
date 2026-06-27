@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, UserSelectMenuBuilder, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ButtonBuilder, ButtonStyle } = require('discord.js');
 const Groq = require('groq-sdk');
 const fs = require('fs');
 
@@ -14,21 +14,51 @@ const client = new Client({
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const conversations = new Map();
+// ════════════════════════════════════════════════════════════════════════════
+// DATA FILES
+// ════════════════════════════════════════════════════════════════════════════
 const SETTINGS_FILE = './member_settings.json';
 const ADMIN_SETTINGS_FILE = './admin_settings.json';
 const OFFENSES_FILE = './offenses.json';
-// Pending ping confirmations: channelId -> { pingType, content, requestedBy }
+const STATS_FILE = './stats.json';
+
+const conversations = new Map();
 const pendingPings = new Map();
-// Pending mod action waiting for user select: userId -> { action }
 const pendingModSelections = new Map();
 
-// ─── Member Settings ────────────────────────────────────────────────────────────
-function loadSettings() {
-  if (!fs.existsSync(SETTINGS_FILE)) return {};
-  return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+function loadJSON(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
-function saveSettings(data) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2)); }
+function saveJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function defaultAdminSettings() {
+  return {
+    aiOnline: true,
+    modPermissions: { ban: false, kick: false, timeout: false, mute: false },
+    timeoutDurationMinutes: 60,
+    strikeThreshold: 3,
+    blockedWords: [],
+    logChannelId: null,
+    restrictedChannelIds: [],
+    trustedRoleIds: []
+  };
+}
+
+function loadAdminSettings() {
+  const data = loadJSON(ADMIN_SETTINGS_FILE, defaultAdminSettings());
+  const defaults = defaultAdminSettings();
+  for (const key of Object.keys(defaults)) {
+    if (data[key] === undefined) data[key] = defaults[key];
+  }
+  return data;
+}
+function saveAdminSettings(data) { saveJSON(ADMIN_SETTINGS_FILE, data); }
+
+function loadSettings() { return loadJSON(SETTINGS_FILE, {}); }
+function saveSettings(data) { saveJSON(SETTINGS_FILE, data); }
 function getUserLanguage(userId) { return loadSettings()[userId]?.language || null; }
 function setUserLanguage(userId, language) {
   const settings = loadSettings();
@@ -37,49 +67,71 @@ function setUserLanguage(userId, language) {
   saveSettings(settings);
 }
 
-// ─── Admin Settings ─────────────────────────────────────────────────────────────
-function loadAdminSettings() {
-  if (!fs.existsSync(ADMIN_SETTINGS_FILE)) {
-    return { aiOnline: true, modPermissions: { ban: false, kick: false, timeout: false, mute: false } };
-  }
-  const data = JSON.parse(fs.readFileSync(ADMIN_SETTINGS_FILE, 'utf8'));
-  if (!data.modPermissions) data.modPermissions = { ban: false, kick: false, timeout: false, mute: false };
-  return data;
-}
-function saveAdminSettings(data) { fs.writeFileSync(ADMIN_SETTINGS_FILE, JSON.stringify(data, null, 2)); }
-function isAdmin(userId) {
-  return process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()).includes(userId) : false;
-}
-
-// ─── Blocked words ───────────────────────────────────────────────────────────────
-const BLOCKED_WORDS = [
-  'nigga', 'nigger', 'fag', 'faggot', 'retard', 'cunt', 'whore',
-  'nazi', 'hitler', 'kys', 'kill yourself',
-  'hure', 'hurensohn', 'wichser', 'spast', 'mongo',
-  'fuck you', 'motherfucker', 'mother fucker', 'fuck u', 'fucker',
-  'asshole', 'dumbass', 'bastard', 'piece of shit', 'son of a bitch'
-];
-function containsOffensiveLanguage(text) {
-  return BLOCKED_WORDS.some(word => text.toLowerCase().includes(word));
-}
-
-// ─── Offense tracking (3 strikes = ban) ───────────────────────────────────────
-function loadOffenses() {
-  if (!fs.existsSync(OFFENSES_FILE)) return {};
-  return JSON.parse(fs.readFileSync(OFFENSES_FILE, 'utf8'));
-}
-function saveOffenses(data) {
-  fs.writeFileSync(OFFENSES_FILE, JSON.stringify(data, null, 2));
-}
+function loadOffenses() { return loadJSON(OFFENSES_FILE, {}); }
+function saveOffenses(data) { saveJSON(OFFENSES_FILE, data); }
 function addOffense(userId) {
   const offenses = loadOffenses();
   offenses[userId] = (offenses[userId] || 0) + 1;
   saveOffenses(offenses);
   return offenses[userId];
 }
+function resetOffenses(userId) {
+  const offenses = loadOffenses();
+  delete offenses[userId];
+  saveOffenses(offenses);
+}
 
+function loadStats() { return loadJSON(STATS_FILE, { totalRequests: 0, userRequests: {} }); }
+function saveStats(data) { saveJSON(STATS_FILE, data); }
+function trackUsage(userId) {
+  const stats = loadStats();
+  stats.totalRequests = (stats.totalRequests || 0) + 1;
+  stats.userRequests[userId] = (stats.userRequests[userId] || 0) + 1;
+  saveStats(stats);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PERMISSIONS
+// ════════════════════════════════════════════════════════════════════════════
+function isAdmin(member) {
+  const envAdmins = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
+  const memberId = member.id || member.user?.id;
+  if (envAdmins.includes(memberId)) return true;
+
+  const settings = loadAdminSettings();
+  if (settings.trustedRoleIds.length === 0) return false;
+
+  const roles = member.roles?.cache;
+  if (!roles) return false;
+  return settings.trustedRoleIds.some(roleId => roles.has(roleId));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// BLOCKED WORDS
+// ════════════════════════════════════════════════════════════════════════════
+const DEFAULT_BLOCKED_WORDS = [
+  'nigga', 'nigger', 'fag', 'faggot', 'retard', 'cunt', 'whore',
+  'nazi', 'hitler', 'kys', 'kill yourself',
+  'hure', 'hurensohn', 'wichser', 'spast', 'mongo',
+  'fuck you', 'motherfucker', 'mother fucker', 'fuck u', 'fucker',
+  'asshole', 'dumbass', 'bastard', 'piece of shit', 'son of a bitch'
+];
+
+function getAllBlockedWords() {
+  const settings = loadAdminSettings();
+  return [...DEFAULT_BLOCKED_WORDS, ...settings.blockedWords];
+}
+function containsOffensiveLanguage(text) {
+  const lower = text.toLowerCase();
+  return getAllBlockedWords().some(word => lower.includes(word));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MOD ACTIONS / PING DETECTION
+// ════════════════════════════════════════════════════════════════════════════
 const MOD_ACTION_WORDS = ['ban', 'kick', 'timeout', 'mute', 'unban', 'unmute'];
 const PING_WORDS = ['everyone', 'here', '@everyone', '@here'];
+const ACTION_TO_PERMISSION = { ban: 'ban', kick: 'kick', timeout: 'timeout', mute: 'mute', unban: 'ban', unmute: 'mute' };
 
 function getModAction(text) {
   const lower = text.toLowerCase();
@@ -88,50 +140,68 @@ function getModAction(text) {
   }
   return null;
 }
-function containsPingWord(text) {
-  return PING_WORDS.some(word => text.toLowerCase().includes(word));
-}
+function containsPingWord(text) { return PING_WORDS.some(word => text.toLowerCase().includes(word)); }
 function extractPingType(text) {
   const lower = text.toLowerCase();
   if (lower.includes('everyone')) return 'everyone';
   if (lower.includes('here')) return 'here';
   return null;
 }
-
-const SYSTEM_PROMPT_BASE = `You are Bikkini AI, a cool and helpful Discord bot assistant.
-Your name is Bikkini AI. You are friendly, helpful, and a little funny sometimes.
-Keep responses concise and to the point - this is Discord, not an essay.`;
-
 function extractUserId(text) {
   const match = text.match(/<@!?(\d+)>/);
   return match ? match[1] : null;
 }
 
-const ACTION_TO_PERMISSION = { ban: 'ban', kick: 'kick', timeout: 'timeout', mute: 'mute', unban: 'ban', unmute: 'mute' };
+// ════════════════════════════════════════════════════════════════════════════
+// LOGGING
+// ════════════════════════════════════════════════════════════════════════════
+async function logAction(guild, description, color) {
+  const settings = loadAdminSettings();
+  if (!settings.logChannelId) return;
+  try {
+    const channel = await guild.channels.fetch(settings.logChannelId);
+    if (channel) {
+      await channel.send({ embeds: [new EmbedBuilder().setColor(color || 0x3498db).setDescription(description).setTimestamp()] });
+    }
+  } catch (err) {
+    console.error('[LOG ERROR]', err);
+  }
+}
 
+// ════════════════════════════════════════════════════════════════════════════
+// MOD ACTION EXECUTION
+// ════════════════════════════════════════════════════════════════════════════
 async function executeModAction(context, action, targetId, reason) {
   const guild = context.guild;
   const send = (content) => context.channel ? context.channel.send(content) : context.followUp(content);
+  const settings = loadAdminSettings();
 
   try {
     const member = await guild.members.fetch(targetId);
-    switch (action) {
-      case 'ban':
-        await member.ban({ reason });
-        return send(`✅ <@${targetId}> has been **banned**.\n**Reason:** ${reason}`);
-      case 'kick':
-        await member.kick(reason);
-        return send(`✅ <@${targetId}> has been **kicked**.\n**Reason:** ${reason}`);
-      case 'timeout':
-      case 'mute':
-        await member.timeout(60 * 60 * 1000, reason);
-        return send(`✅ <@${targetId}> has been **timed out for 1 hour**.\n**Reason:** ${reason}`);
-      case 'unban':
-        await guild.members.unban(targetId, reason);
-        return send(`✅ <@${targetId}> has been **unbanned**.`);
-      case 'unmute':
-        await member.timeout(null);
-        return send(`✅ <@${targetId}> has been **unmuted**.`);
+    if (action === 'ban') {
+      await member.ban({ reason });
+      await logAction(guild, `🔨 <@${targetId}> was **banned**.\nReason: ${reason}`, 0xe74c3c);
+      return send(`✅ <@${targetId}> has been **banned**.\n**Reason:** ${reason}`);
+    }
+    if (action === 'kick') {
+      await member.kick(reason);
+      await logAction(guild, `👋 <@${targetId}> was **kicked**.\nReason: ${reason}`, 0xe67e22);
+      return send(`✅ <@${targetId}> has been **kicked**.\n**Reason:** ${reason}`);
+    }
+    if (action === 'timeout' || action === 'mute') {
+      await member.timeout(settings.timeoutDurationMinutes * 60 * 1000, reason);
+      await logAction(guild, `🔇 <@${targetId}> was **timed out** for ${settings.timeoutDurationMinutes} minutes.\nReason: ${reason}`, 0xf1c40f);
+      return send(`✅ <@${targetId}> has been **timed out for ${settings.timeoutDurationMinutes} minutes**.\n**Reason:** ${reason}`);
+    }
+    if (action === 'unban') {
+      await guild.members.unban(targetId, reason);
+      await logAction(guild, `🔓 <@${targetId}> was **unbanned**.`, 0x2ecc71);
+      return send(`✅ <@${targetId}> has been **unbanned**.`);
+    }
+    if (action === 'unmute') {
+      await member.timeout(null);
+      await logAction(guild, `🔊 <@${targetId}> was **unmuted**.`, 0x2ecc71);
+      return send(`✅ <@${targetId}> has been **unmuted**.`);
     }
   } catch (err) {
     console.error('[MOD ACTION ERROR]', err);
@@ -139,32 +209,36 @@ async function executeModAction(context, action, targetId, reason) {
   }
 }
 
-// ─── /ai Handler ───────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT_BASE = `You are Bikkini AI, a cool and helpful Discord bot assistant.
+Your name is Bikkini AI. You are friendly, helpful, and a little funny sometimes.
+Keep responses concise and to the point - this is Discord, not an essay.`;
+
+// ════════════════════════════════════════════════════════════════════════════
+// /ai HANDLER
+// ════════════════════════════════════════════════════════════════════════════
 async function handleAI(message, prompt) {
   const adminSettings = loadAdminSettings();
+  const userIsAdmin = isAdmin(message.member);
 
   if (!adminSettings.aiOnline) {
     return message.reply({ content: '🔴 Bikkini AI is currently offline (turned off by an Admin).', allowedMentions: { parse: [] } });
   }
 
-  // ?ai confirm - admin confirms a pending ping
+  if (adminSettings.restrictedChannelIds.length > 0 && !adminSettings.restrictedChannelIds.includes(message.channel.id) && !userIsAdmin) {
+    return message.reply({ content: '❌ Bikkini AI cannot be used in this channel.', allowedMentions: { parse: [] } });
+  }
+
   if (prompt.trim().toLowerCase() === 'confirm') {
-    if (!isAdmin(message.author.id)) {
-      return message.reply({ content: '❌ Only admins can confirm pings.', allowedMentions: { parse: [] } });
-    }
+    if (!userIsAdmin) return message.reply({ content: '❌ Only admins can confirm pings.', allowedMentions: { parse: [] } });
 
     const pending = pendingPings.get(message.channel.id);
-    if (!pending) {
-      return message.reply('❌ There is no pending ping to confirm in this channel.');
-    }
+    if (!pending) return message.reply('❌ There is no pending ping to confirm in this channel.');
 
     const mention = pending.pingType === 'everyone' ? '@everyone' : '@here';
     pendingPings.delete(message.channel.id);
+    await logAction(message.guild, `📢 <@${message.author.id}> confirmed a **${mention}** ping.`, 0x3498db);
 
-    return message.channel.send({
-      content: `${mention} ${pending.content}`,
-      allowedMentions: { parse: ['everyone'] }
-    });
+    return message.channel.send({ content: `${mention} ${pending.content}`, allowedMentions: { parse: ['everyone'] } });
   }
 
   if (!prompt) {
@@ -174,41 +248,31 @@ async function handleAI(message, prompt) {
   if (containsOffensiveLanguage(prompt)) {
     const offenseCount = addOffense(message.author.id);
 
-    if (offenseCount >= 3) {
+    if (offenseCount >= adminSettings.strikeThreshold) {
       try {
-        await message.member.ban({ reason: 'Used offensive language with ?ai 3 times' });
-        return message.reply({
-          content: `🔨 **${message.author.tag}** has been **banned** for repeatedly using offensive language (3rd offense).`,
-          allowedMentions: { parse: [] }
-        });
+        await message.member.ban({ reason: `Used offensive language with ?ai ${adminSettings.strikeThreshold} times` });
+        await logAction(message.guild, `🔨 <@${message.author.id}> was **auto-banned** after reaching ${adminSettings.strikeThreshold} offensive language strikes.`, 0xe74c3c);
+        return message.reply({ content: `🔨 **${message.author.tag}** has been **banned** for repeatedly using offensive language (strike ${offenseCount}/${adminSettings.strikeThreshold}).`, allowedMentions: { parse: [] } });
       } catch (err) {
         console.error('[BAN ERROR]', err);
         return message.reply({ content: '❌ Tried to ban you for repeated offenses but could not (check my permissions).', allowedMentions: { parse: [] } });
       }
     }
 
-    try { await message.member.timeout(60 * 60 * 1000, 'Used offensive language with ?ai'); } catch {}
+    try { await message.member.timeout(adminSettings.timeoutDurationMinutes * 60 * 1000, 'Used offensive language with ?ai'); } catch {}
+    await logAction(message.guild, `⚠️ <@${message.author.id}> received strike ${offenseCount}/${adminSettings.strikeThreshold} for offensive language.`, 0xf1c40f);
     return message.reply({
-      content: `🔇 You have been timed out for 1 hour for using offensive language. **Warning ${offenseCount}/3** — on your 3rd offense you will be banned.`,
+      content: `🔇 You have been timed out for ${adminSettings.timeoutDurationMinutes} minutes for using offensive language. **Warning ${offenseCount}/${adminSettings.strikeThreshold}** — reaching the limit results in a ban.`,
       allowedMentions: { parse: [] }
     });
   }
 
-  // Everyone/here ping request
   if (containsPingWord(prompt)) {
     const pingType = extractPingType(prompt);
-
-    if (!isAdmin(message.author.id)) {
-      return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
-    }
+    if (!userIsAdmin) return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
 
     const pingContent = prompt.replace(/@?everyone/gi, '').replace(/@?here/gi, '').trim();
-
-    pendingPings.set(message.channel.id, {
-      pingType,
-      content: pingContent,
-      requestedBy: message.author.id
-    });
+    pendingPings.set(message.channel.id, { pingType, content: pingContent, requestedBy: message.author.id });
 
     return message.reply({
       content: `⏳ Wait for an Admin to confirm to ping @${pingType}. An admin can type \`?ai confirm\` to send it.`,
@@ -216,12 +280,9 @@ async function handleAI(message, prompt) {
     });
   }
 
-  // Mod action request
   const modAction = getModAction(prompt);
   if (modAction) {
-    if (!isAdmin(message.author.id)) {
-      return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
-    }
+    if (!userIsAdmin) return message.reply({ content: '⚠️ You need a confirmation from an Admin to do this.', allowedMentions: { parse: [] } });
 
     const permKey = ACTION_TO_PERMISSION[modAction];
     if (!adminSettings.modPermissions[permKey]) {
@@ -232,23 +293,18 @@ async function handleAI(message, prompt) {
     const targetId = extractUserId(rest);
 
     if (targetId) {
-      // User was mentioned directly - execute right away
       const reason = rest.replace(/<@!?\d+>/, '').trim() || `Action requested via Bikkini AI by ${message.author.tag}`;
       return await executeModAction(message, modAction, targetId, reason);
     }
 
-    // No user mentioned - show a user select menu
     pendingModSelections.set(message.author.id, { action: modAction, reason: rest || `Action requested via Bikkini AI by ${message.author.tag}` });
-
     const row = new ActionRowBuilder().addComponents(
-      new UserSelectMenuBuilder()
-        .setCustomId('modaction_userselect')
-        .setPlaceholder(`Select a user to ${modAction}`)
+      new UserSelectMenuBuilder().setCustomId('modaction_userselect').setPlaceholder(`Select a user to ${modAction}`)
     );
-
     return message.reply({ content: `Select the user you want to **${modAction}**:`, components: [row] });
   }
 
+  trackUsage(message.author.id);
   const userId = message.author.id;
   await message.channel.sendTyping();
 
@@ -259,11 +315,9 @@ async function handleAI(message, prompt) {
 
   const userLanguage = getUserLanguage(userId);
   let systemPrompt = SYSTEM_PROMPT_BASE;
-  if (userLanguage) {
-    systemPrompt += `\nIMPORTANT: This user has set their preferred language to "${userLanguage}". ALWAYS respond in that language.`;
-  } else {
-    systemPrompt += `\nVERY IMPORTANT: Always detect the language the user is writing in and respond in that EXACT same language.`;
-  }
+  systemPrompt += userLanguage
+    ? `\nIMPORTANT: This user has set their preferred language to "${userLanguage}". ALWAYS respond in that language.`
+    : `\nVERY IMPORTANT: Always detect the language the user is writing in and respond in that EXACT same language.`;
 
   try {
     const response = await groq.chat.completions.create({
@@ -280,9 +334,7 @@ async function handleAI(message, prompt) {
       await message.reply({ content: safeReply, allowedMentions: { parse: ['users'] } });
     } else {
       const chunks = safeReply.match(/.{1,1900}/gs);
-      for (const chunk of chunks) {
-        await message.channel.send({ content: chunk, allowedMentions: { parse: ['users'] } });
-      }
+      for (const chunk of chunks) await message.channel.send({ content: chunk, allowedMentions: { parse: ['users'] } });
     }
   } catch (err) {
     console.error('[AI ERROR]', err);
@@ -290,14 +342,18 @@ async function handleAI(message, prompt) {
   }
 }
 
-// ─── /membersettings with Select Menu ──────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// /membersettings
+// ════════════════════════════════════════════════════════════════════════════
 async function handleMemberSettings(message) {
   const current = getUserLanguage(message.author.id);
+  const offenses = loadOffenses()[message.author.id] || 0;
+  const threshold = loadAdminSettings().strikeThreshold;
 
   const embed = new EmbedBuilder()
     .setColor(0x9b59b6)
     .setTitle('⚙️ Member Settings')
-    .setDescription(`Current language: **${current || 'Auto-detect'}**\n\nUse the menu below to manage your settings.`);
+    .setDescription(`**Language:** ${current || 'Auto-detect'}\n**Your strikes:** ${offenses}/${threshold}\n\nUse the menu below to manage your settings.`);
 
   const row = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -312,12 +368,10 @@ async function handleMemberSettings(message) {
   await message.reply({ embeds: [embed], components: [row] });
 }
 
-// ─── /adminsettings with Select Menu ────────────────────────────────────────────
-async function handleAdminSettings(message) {
-  if (!isAdmin(message.author.id)) {
-    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
-  }
-
+// ════════════════════════════════════════════════════════════════════════════
+// /adminsettings
+// ════════════════════════════════════════════════════════════════════════════
+async function buildAdminSettingsPanel() {
   const settings = loadAdminSettings();
   const mp = settings.modPermissions;
 
@@ -326,10 +380,16 @@ async function handleAdminSettings(message) {
     .setTitle('🛠️ Admin Settings')
     .addFields(
       { name: 'AI Status', value: settings.aiOnline ? '🟢 Online' : '🔴 Offline', inline: true },
-      { name: 'Ban', value: mp.ban ? '✅ Enabled' : '❌ Disabled', inline: true },
-      { name: 'Kick', value: mp.kick ? '✅ Enabled' : '❌ Disabled', inline: true },
-      { name: 'Timeout', value: mp.timeout ? '✅ Enabled' : '❌ Disabled', inline: true },
-      { name: 'Mute', value: mp.mute ? '✅ Enabled' : '❌ Disabled', inline: true }
+      { name: 'Timeout Duration', value: `${settings.timeoutDurationMinutes} min`, inline: true },
+      { name: 'Strike Threshold', value: `${settings.strikeThreshold} strikes`, inline: true },
+      { name: 'Ban', value: mp.ban ? '✅' : '❌', inline: true },
+      { name: 'Kick', value: mp.kick ? '✅' : '❌', inline: true },
+      { name: 'Timeout', value: mp.timeout ? '✅' : '❌', inline: true },
+      { name: 'Mute', value: mp.mute ? '✅' : '❌', inline: true },
+      { name: 'Log Channel', value: settings.logChannelId ? `<#${settings.logChannelId}>` : 'Not set', inline: true },
+      { name: 'Restricted Channels', value: settings.restrictedChannelIds.length ? settings.restrictedChannelIds.map(id => `<#${id}>`).join(', ') : 'None (all allowed)', inline: false },
+      { name: 'Trusted Roles', value: settings.trustedRoleIds.length ? settings.trustedRoleIds.map(id => `<@&${id}>`).join(', ') : 'None', inline: false },
+      { name: 'Custom Blocked Words', value: settings.blockedWords.length ? settings.blockedWords.join(', ') : 'None', inline: false }
     )
     .setDescription('Use the menu below to change settings.');
 
@@ -347,14 +407,44 @@ async function handleAdminSettings(message) {
         { label: 'Timeout: Enable', value: 'timeout_on', emoji: '✅' },
         { label: 'Timeout: Disable', value: 'timeout_off', emoji: '❌' },
         { label: 'Mute: Enable', value: 'mute_on', emoji: '✅' },
-        { label: 'Mute: Disable', value: 'mute_off', emoji: '❌' }
+        { label: 'Mute: Disable', value: 'mute_off', emoji: '❌' },
+        { label: 'Set Timeout Duration', value: 'set_timeout_duration', emoji: '⏱️' },
+        { label: 'Set Strike Threshold', value: 'set_strike_threshold', emoji: '🎯' },
+        { label: 'Add Blocked Word', value: 'add_blocked_word', emoji: '🚫' },
+        { label: 'Remove Blocked Word', value: 'remove_blocked_word', emoji: '🗑️' },
+        { label: 'Set Log Channel', value: 'set_log_channel', emoji: '📝' },
+        { label: 'Disable Logging', value: 'disable_logging', emoji: '🔕' },
+        { label: 'Restrict to Channels', value: 'set_restricted_channels', emoji: '🔒' },
+        { label: 'Allow All Channels', value: 'clear_restricted_channels', emoji: '🔓' },
+        { label: 'Add Trusted Role', value: 'add_trusted_role', emoji: '👮' },
+        { label: 'Clear Trusted Roles', value: 'clear_trusted_roles', emoji: '🧹' },
+        { label: 'View Stats', value: 'view_stats', emoji: '📊' },
+        { label: 'Reset a User\'s Strikes', value: 'reset_user_strikes', emoji: '🔄' }
       ])
   );
 
-  await message.reply({ embeds: [embed], components: [row] });
+  return { embeds: [embed], components: [row] };
 }
 
-// ─── Other commands ─────────────────────────────────────────────────────────────
+// ─── handleAdminSettings: requires password before showing panel ─────────────
+async function handleAdminSettings(message) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminsettings_unlock').setLabel('🔒 Enter Password to Get Access').setStyle(ButtonStyle.Primary)
+  );
+
+  await message.reply({
+    embeds: [new EmbedBuilder().setColor(0xe67e22).setTitle('🔒 Admin Access Required').setDescription('Click the button below and enter the password to access Admin Settings.')],
+    components: [row]
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Other text commands
+// ════════════════════════════════════════════════════════════════════════════
 function handleHelp(message) {
   message.reply([
     '**🤖 Bikkini AI – Commands**', '',
@@ -381,7 +471,9 @@ function handleReset(message) {
   message.reply('🔄 Your conversation history has been reset!');
 }
 
-// ─── Message Router ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Message Router
+// ════════════════════════════════════════════════════════════════════════════
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.content.startsWith('?')) return;
@@ -403,10 +495,43 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// ─── Interactions ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Interactions
+// ════════════════════════════════════════════════════════════════════════════
 client.on('interactionCreate', async (interaction) => {
 
-  // ── Member Settings Select Menu ───────────────────────────────────────────
+  // ── Admin Settings: Password Unlock Button ────────────────────────────────
+  if (interaction.isButton() && interaction.customId === 'adminsettings_unlock') {
+    if (!isAdmin(interaction.member)) {
+      return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+    }
+
+    const modal = new ModalBuilder().setCustomId('adminsettings_password_modal').setTitle('🔒 Admin Access');
+    const input = new TextInputBuilder()
+      .setCustomId('password_input')
+      .setLabel('Enter Password for Access')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('Enter password...')
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    return await interaction.showModal(modal);
+  }
+
+  // ── Admin Settings: Password Check ─────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId === 'adminsettings_password_modal') {
+    if (!isAdmin(interaction.member)) {
+      return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+    }
+
+    const password = interaction.fields.getTextInputValue('password_input').trim();
+    if (password !== '5362') {
+      return await interaction.reply({ content: '❌ Incorrect password.', ephemeral: true });
+    }
+
+    const panel = await buildAdminSettingsPanel();
+    return await interaction.reply({ ...panel, ephemeral: true });
+  }
+
   if (interaction.isStringSelectMenu() && interaction.customId === 'membersettings_menu') {
     const choice = interaction.values[0];
 
@@ -419,27 +544,19 @@ client.on('interactionCreate', async (interaction) => {
 
     if (choice === 'set_language') {
       const modal = new ModalBuilder().setCustomId('language_modal').setTitle('Set Your Language');
-      const input = new TextInputBuilder()
-        .setCustomId('language_input')
-        .setLabel('Language / Country')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('e.g. German, Spanish, Turkish...')
-        .setRequired(true);
+      const input = new TextInputBuilder().setCustomId('language_input').setLabel('Language / Country').setStyle(TextInputStyle.Short).setPlaceholder('e.g. German, Spanish, Turkish...').setRequired(true);
       modal.addComponents(new ActionRowBuilder().addComponents(input));
       return await interaction.showModal(modal);
     }
   }
 
-  // ── Admin Settings Select Menu ────────────────────────────────────────────
   if (interaction.isStringSelectMenu() && interaction.customId === 'adminsettings_menu') {
-    if (!isAdmin(interaction.user.id)) {
-      return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
-    }
+    if (!isAdmin(interaction.member)) return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
 
     const choice = interaction.values[0];
     const settings = loadAdminSettings();
 
-    const map = {
+    const simpleToggles = {
       ai_online: () => { settings.aiOnline = true; return '🟢 Bikkini AI is now **online**.'; },
       ai_offline: () => { settings.aiOnline = false; return '🔴 Bikkini AI is now **offline**.'; },
       ban_on: () => { settings.modPermissions.ban = true; return '✅ **Ban** command enabled.'; },
@@ -449,27 +566,165 @@ client.on('interactionCreate', async (interaction) => {
       timeout_on: () => { settings.modPermissions.timeout = true; return '✅ **Timeout** command enabled.'; },
       timeout_off: () => { settings.modPermissions.timeout = false; return '❌ **Timeout** command disabled.'; },
       mute_on: () => { settings.modPermissions.mute = true; return '✅ **Mute** command enabled.'; },
-      mute_off: () => { settings.modPermissions.mute = false; return '❌ **Mute** command disabled.'; }
+      mute_off: () => { settings.modPermissions.mute = false; return '❌ **Mute** command disabled.'; },
+      disable_logging: () => { settings.logChannelId = null; return '🔕 Logging disabled.'; },
+      clear_restricted_channels: () => { settings.restrictedChannelIds = []; return '🔓 Bikkini AI can now be used in all channels.'; },
+      clear_trusted_roles: () => { settings.trustedRoleIds = []; return '🧹 Trusted roles cleared.'; }
     };
 
-    const msg = map[choice] ? map[choice]() : '❌ Unknown option.';
-    saveAdminSettings(settings);
-    return await interaction.reply({ content: msg, ephemeral: true });
+    if (simpleToggles[choice]) {
+      const msg = simpleToggles[choice]();
+      saveAdminSettings(settings);
+      return await interaction.reply({ content: msg, ephemeral: true });
+    }
+
+    if (choice === 'set_timeout_duration') {
+      const modal = new ModalBuilder().setCustomId('admin_timeout_modal').setTitle('Set Timeout Duration');
+      const input = new TextInputBuilder().setCustomId('timeout_minutes').setLabel('Duration in minutes').setStyle(TextInputStyle.Short).setPlaceholder('e.g. 60').setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'set_strike_threshold') {
+      const modal = new ModalBuilder().setCustomId('admin_strikes_modal').setTitle('Set Strike Threshold');
+      const input = new TextInputBuilder().setCustomId('strike_count').setLabel('Number of strikes before ban').setStyle(TextInputStyle.Short).setPlaceholder('e.g. 3').setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'add_blocked_word') {
+      const modal = new ModalBuilder().setCustomId('admin_addword_modal').setTitle('Add Blocked Word');
+      const input = new TextInputBuilder().setCustomId('word_input').setLabel('Word or phrase to block').setStyle(TextInputStyle.Short).setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'remove_blocked_word') {
+      if (settings.blockedWords.length === 0) {
+        return await interaction.reply({ content: '❌ There are no custom blocked words to remove.', ephemeral: true });
+      }
+      const modal = new ModalBuilder().setCustomId('admin_removeword_modal').setTitle('Remove Blocked Word');
+      const input = new TextInputBuilder().setCustomId('word_input').setLabel('Word to remove').setStyle(TextInputStyle.Short).setPlaceholder(settings.blockedWords.join(', ')).setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'set_log_channel') {
+      const row = new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('admin_logchannel_select').setPlaceholder('Select a log channel'));
+      return await interaction.reply({ content: 'Select the channel for mod-action logs:', components: [row], ephemeral: true });
+    }
+
+    if (choice === 'set_restricted_channels') {
+      const row = new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('admin_restrictchannel_select').setPlaceholder('Select allowed channels').setMinValues(1).setMaxValues(10));
+      return await interaction.reply({ content: 'Select the channels where `?ai` is allowed:', components: [row], ephemeral: true });
+    }
+
+    if (choice === 'add_trusted_role') {
+      const row = new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('admin_trustedrole_select').setPlaceholder('Select a trusted role'));
+      return await interaction.reply({ content: 'Select a role that should be treated as Admin by Bikkini AI:', components: [row], ephemeral: true });
+    }
+
+    if (choice === 'view_stats') {
+      const stats = loadStats();
+      const topUsers = Object.entries(stats.userRequests || {})
+        .sort((a, b) => b[1] - a[1]).slice(0, 5)
+        .map(([id, count], i) => `${i + 1}. <@${id}> — ${count} requests`).join('\n') || 'No data yet.';
+
+      const offenses = loadOffenses();
+      const topOffenders = Object.entries(offenses)
+        .sort((a, b) => b[1] - a[1]).slice(0, 5)
+        .map(([id, count], i) => `${i + 1}. <@${id}> — ${count} strikes`).join('\n') || 'No strikes recorded.';
+
+      return await interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0x3498db)
+          .setTitle('📊 Bikkini AI Stats')
+          .addFields(
+            { name: 'Total Requests', value: `${stats.totalRequests || 0}`, inline: true },
+            { name: 'Top Users', value: topUsers, inline: false },
+            { name: 'Top Offenders (Strikes)', value: topOffenders, inline: false }
+          )],
+        ephemeral: true
+      });
+    }
+
+    if (choice === 'reset_user_strikes') {
+      const row = new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId('admin_resetstrikes_select').setPlaceholder('Select a user to reset strikes'));
+      return await interaction.reply({ content: 'Select the user whose strikes you want to reset:', components: [row], ephemeral: true });
+    }
   }
 
-  // ── Language Modal Submit ─────────────────────────────────────────────────
   if (interaction.isModalSubmit() && interaction.customId === 'language_modal') {
     const language = interaction.fields.getTextInputValue('language_input');
     setUserLanguage(interaction.user.id, language);
     return await interaction.reply({ content: `✅ Your language has been set to **${language}**!`, ephemeral: true });
   }
 
-  // ── Mod Action User Select ────────────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId === 'admin_timeout_modal') {
+    const minutes = parseInt(interaction.fields.getTextInputValue('timeout_minutes'));
+    if (isNaN(minutes) || minutes < 1) return await interaction.reply({ content: '❌ Please enter a valid number of minutes.', ephemeral: true });
+    const settings = loadAdminSettings();
+    settings.timeoutDurationMinutes = minutes;
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Timeout duration set to **${minutes} minutes**.`, ephemeral: true });
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'admin_strikes_modal') {
+    const count = parseInt(interaction.fields.getTextInputValue('strike_count'));
+    if (isNaN(count) || count < 1) return await interaction.reply({ content: '❌ Please enter a valid number.', ephemeral: true });
+    const settings = loadAdminSettings();
+    settings.strikeThreshold = count;
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Strike threshold set to **${count}**.`, ephemeral: true });
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'admin_addword_modal') {
+    const word = interaction.fields.getTextInputValue('word_input').toLowerCase().trim();
+    const settings = loadAdminSettings();
+    if (!settings.blockedWords.includes(word)) settings.blockedWords.push(word);
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Added **"${word}"** to the blocked words list.`, ephemeral: true });
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'admin_removeword_modal') {
+    const word = interaction.fields.getTextInputValue('word_input').toLowerCase().trim();
+    const settings = loadAdminSettings();
+    settings.blockedWords = settings.blockedWords.filter(w => w !== word);
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Removed **"${word}"** from the blocked words list (if it existed).`, ephemeral: true });
+  }
+
+  if (interaction.isChannelSelectMenu() && interaction.customId === 'admin_logchannel_select') {
+    const settings = loadAdminSettings();
+    settings.logChannelId = interaction.values[0];
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Log channel set to <#${interaction.values[0]}>.`, ephemeral: true });
+  }
+
+  if (interaction.isChannelSelectMenu() && interaction.customId === 'admin_restrictchannel_select') {
+    const settings = loadAdminSettings();
+    settings.restrictedChannelIds = interaction.values;
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ Bikkini AI is now restricted to: ${interaction.values.map(id => `<#${id}>`).join(', ')}`, ephemeral: true });
+  }
+
+  if (interaction.isRoleSelectMenu() && interaction.customId === 'admin_trustedrole_select') {
+    const settings = loadAdminSettings();
+    const roleId = interaction.values[0];
+    if (!settings.trustedRoleIds.includes(roleId)) settings.trustedRoleIds.push(roleId);
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: `✅ <@&${roleId}> is now treated as Admin by Bikkini AI.`, ephemeral: true });
+  }
+
+  if (interaction.isUserSelectMenu() && interaction.customId === 'admin_resetstrikes_select') {
+    const targetId = interaction.values[0];
+    resetOffenses(targetId);
+    return await interaction.reply({ content: `✅ Strikes for <@${targetId}> have been reset.`, ephemeral: true });
+  }
+
   if (interaction.isUserSelectMenu() && interaction.customId === 'modaction_userselect') {
     const pending = pendingModSelections.get(interaction.user.id);
-    if (!pending) {
-      return await interaction.reply({ content: '❌ This request has expired.', ephemeral: true });
-    }
+    if (!pending) return await interaction.reply({ content: '❌ This request has expired.', ephemeral: true });
 
     const targetId = interaction.values[0];
     pendingModSelections.delete(interaction.user.id);
