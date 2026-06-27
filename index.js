@@ -452,7 +452,12 @@ function handleHelp(message) {
     '**🤖 Bikkini AI – Commands**', '',
     '`?ai <question>` – Ask Bikkini AI anything',
     '`?ai membersettings` – Manage your personal settings',
+    '`?ai languagepanel` – Quick language selector',
     '`?ai adminsettings` – Admin controls (Admin only)',
+    '`?ai modpanel` – Quick moderation panel (Admin only)',
+    '`?ai statspanel` – Server stats panel (Admin only)',
+    '`?ai userpanel @user` – View/manage a specific user (Admin only)',
+    '`?ai securitypanel` – Security settings panel (Admin only)',
     '`?reset` – Reset your conversation history',
     '`?help` – Show this help menu',
     '`?info` – Info about Bikkini AI'
@@ -487,6 +492,11 @@ client.on('messageCreate', async (message) => {
     const sub = args[0]?.toLowerCase();
     if (sub === 'membersettings') return await handleMemberSettings(message);
     if (sub === 'adminsettings') return await handleAdminSettings(message);
+    if (sub === 'modpanel') return await handleModPanel(message);
+    if (sub === 'statspanel') return await handleStatsPanel(message);
+    if (sub === 'userpanel') return await handleUserPanel(message, args.slice(1).join(' '));
+    if (sub === 'languagepanel') return await handleLanguagePanel(message);
+    if (sub === 'securitypanel') return await handleSecurityPanel(message);
     return await handleAI(message, args.join(' '));
   }
 
@@ -760,11 +770,325 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.update({ content: `Processing **${pending.action}** on <@${targetId}>...`, components: [] });
     await executeModAction(interaction, pending.action, targetId, pending.reason);
   }
+
+  // ── /modpanel: action chosen, now show user select ────────────────────────
+  if (interaction.isStringSelectMenu() && interaction.customId === 'modpanel_action_select') {
+    if (!isAdmin(interaction.member)) return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+
+    const action = interaction.values[0];
+    const settings = loadAdminSettings();
+    const permKey = ACTION_TO_PERMISSION[action];
+
+    if (settings.modPermissions[permKey] === false && action !== 'unban' && action !== 'unmute') {
+      return await interaction.reply({ content: `⚠️ The **${action}** command is currently disabled in \`?ai adminsettings\`.`, ephemeral: true });
+    }
+
+    pendingModSelections.set(interaction.user.id, { action, reason: `Action requested via Bikkini AI Mod Panel by ${interaction.user.tag}` });
+
+    const row = new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder().setCustomId('modaction_userselect').setPlaceholder(`Select a user to ${action}`)
+    );
+    return await interaction.update({ content: `Select the user you want to **${action}**:`, embeds: [], components: [row] });
+  }
+
+  // ── /statspanel buttons ─────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId === 'statspanel_topusers') {
+    const stats = loadStats();
+    const topUsers = Object.entries(stats.userRequests || {})
+      .sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([id, count], i) => `${i + 1}. <@${id}> — ${count} requests`).join('\n') || 'No data yet.';
+    return await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('🏆 Top Users').setDescription(topUsers)], ephemeral: true });
+  }
+
+  if (interaction.isButton() && interaction.customId === 'statspanel_topoffenders') {
+    const offenses = loadOffenses();
+    const topOffenders = Object.entries(offenses)
+      .sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([id, count], i) => `${i + 1}. <@${id}> — ${count} strikes`).join('\n') || 'No strikes recorded.';
+    return await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle('⚠️ Top Offenders').setDescription(topOffenders)], ephemeral: true });
+  }
+
+  if (interaction.isButton() && interaction.customId === 'statspanel_overview') {
+    const stats = loadStats();
+    const offenses = loadOffenses();
+    const totalStrikes = Object.values(offenses).reduce((a, b) => a + b, 0);
+    return await interaction.reply({
+      embeds: [new EmbedBuilder().setColor(0x2ecc71).setTitle('📈 Server Activity')
+        .addFields(
+          { name: 'Total AI Requests', value: `${stats.totalRequests || 0}`, inline: true },
+          { name: 'Unique Users', value: `${Object.keys(stats.userRequests || {}).length}`, inline: true },
+          { name: 'Total Strikes Issued', value: `${totalStrikes}`, inline: true }
+        )],
+      ephemeral: true
+    });
+  }
+
+  // ── /userpanel: select user, then show panel ────────────────────────────────
+  if (interaction.isUserSelectMenu() && interaction.customId === 'userpanel_select') {
+    if (!isAdmin(interaction.member)) return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+    const targetId = interaction.values[0];
+    const panel = await buildUserPanelEmbed(interaction.guild, targetId);
+    return await interaction.update({ content: null, ...panel });
+  }
+
+  // ── /userpanel buttons ──────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('userpanel_resetstrikes_')) {
+    const targetId = interaction.customId.split('_')[2];
+    resetOffenses(targetId);
+    const panel = await buildUserPanelEmbed(interaction.guild, targetId);
+    return await interaction.update(panel);
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('userpanel_ban_')) {
+    const targetId = interaction.customId.split('_')[2];
+    await interaction.update({ content: `Processing ban on <@${targetId}>...`, embeds: [], components: [] });
+    await executeModAction(interaction, 'ban', targetId, `Banned via User Panel by ${interaction.user.tag}`);
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('userpanel_timeout_')) {
+    const targetId = interaction.customId.split('_')[2];
+    await interaction.update({ content: `Processing timeout on <@${targetId}>...`, embeds: [], components: [] });
+    await executeModAction(interaction, 'timeout', targetId, `Timed out via User Panel by ${interaction.user.tag}`);
+  }
+
+  // ── /languagepanel select ────────────────────────────────────────────────────
+  if (interaction.isStringSelectMenu() && interaction.customId === 'languagepanel_select') {
+    const choice = interaction.values[0];
+
+    if (choice === 'reset') {
+      const settings = loadSettings();
+      if (settings[interaction.user.id]) delete settings[interaction.user.id].language;
+      saveSettings(settings);
+      return await interaction.reply({ content: '✅ Language reset to auto-detect!', ephemeral: true });
+    }
+
+    if (choice === 'custom') {
+      const modal = new ModalBuilder().setCustomId('language_modal').setTitle('Set Custom Language');
+      const input = new TextInputBuilder().setCustomId('language_input').setLabel('Language / Country').setStyle(TextInputStyle.Short).setPlaceholder('e.g. Dutch, Korean...').setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    setUserLanguage(interaction.user.id, choice);
+    return await interaction.reply({ content: `✅ Your language has been set to **${choice}**!`, ephemeral: true });
+  }
+
+  // ── /securitypanel menu ──────────────────────────────────────────────────────
+  if (interaction.isStringSelectMenu() && interaction.customId === 'securitypanel_menu') {
+    if (!isAdmin(interaction.member)) return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+
+    const choice = interaction.values[0];
+    const settings = loadAdminSettings();
+
+    if (choice === 'add_word') {
+      const modal = new ModalBuilder().setCustomId('admin_addword_modal').setTitle('Add Blocked Word');
+      const input = new TextInputBuilder().setCustomId('word_input').setLabel('Word or phrase to block').setStyle(TextInputStyle.Short).setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'remove_word') {
+      if (settings.blockedWords.length === 0) return await interaction.reply({ content: '❌ No custom blocked words to remove.', ephemeral: true });
+      const modal = new ModalBuilder().setCustomId('admin_removeword_modal').setTitle('Remove Blocked Word');
+      const input = new TextInputBuilder().setCustomId('word_input').setLabel('Word to remove').setStyle(TextInputStyle.Short).setPlaceholder(settings.blockedWords.join(', ')).setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
+
+    if (choice === 'add_role') {
+      const row = new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('admin_trustedrole_select').setPlaceholder('Select a trusted role'));
+      return await interaction.reply({ content: 'Select a role to trust as Admin:', components: [row], ephemeral: true });
+    }
+
+    if (choice === 'clear_roles') {
+      settings.trustedRoleIds = [];
+      saveAdminSettings(settings);
+      return await interaction.reply({ content: '🧹 Trusted roles cleared.', ephemeral: true });
+    }
+  }
 });
 
 client.once('ready', () => {
   console.log(`✅ Bikkini AI is online as: ${client.user.tag}`);
   client.user.setActivity('?ai | Bikkini AI', { type: 3 });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// /modpanel - quick mod actions without typing commands
+// ════════════════════════════════════════════════════════════════════════════
+async function handleModPanel(message) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const settings = loadAdminSettings();
+  const mp = settings.modPermissions;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe74c3c)
+    .setTitle('🔨 Moderation Panel')
+    .setDescription('Pick an action below, then select the user to apply it to.')
+    .addFields(
+      { name: 'Ban', value: mp.ban ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Kick', value: mp.kick ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Timeout/Mute', value: (mp.timeout || mp.mute) ? '✅ Enabled' : '❌ Disabled', inline: true }
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('modpanel_action_select')
+      .setPlaceholder('Choose an action')
+      .addOptions([
+        { label: 'Ban', value: 'ban', emoji: '🔨' },
+        { label: 'Kick', value: 'kick', emoji: '👋' },
+        { label: 'Timeout', value: 'timeout', emoji: '🔇' },
+        { label: 'Mute', value: 'mute', emoji: '🔇' },
+        { label: 'Unban', value: 'unban', emoji: '🔓' },
+        { label: 'Unmute', value: 'unmute', emoji: '🔊' }
+      ])
+  );
+
+  await message.reply({ embeds: [embed], components: [row] });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /statspanel - clickable stats overview
+// ════════════════════════════════════════════════════════════════════════════
+async function handleStatsPanel(message) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x3498db)
+    .setTitle('📊 Stats Panel')
+    .setDescription('Click a button below to view different stats.');
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('statspanel_topusers').setLabel('Top Users').setStyle(ButtonStyle.Primary).setEmoji('🏆'),
+    new ButtonBuilder().setCustomId('statspanel_topoffenders').setLabel('Top Offenders').setStyle(ButtonStyle.Danger).setEmoji('⚠️'),
+    new ButtonBuilder().setCustomId('statspanel_overview').setLabel('Server Activity').setStyle(ButtonStyle.Secondary).setEmoji('📈')
+  );
+
+  await message.reply({ embeds: [embed], components: [row] });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /userpanel @user - view & manage a single user
+// ════════════════════════════════════════════════════════════════════════════
+async function buildUserPanelEmbed(guild, targetId) {
+  const offenses = loadOffenses()[targetId] || 0;
+  const threshold = loadAdminSettings().strikeThreshold;
+  const stats = loadStats();
+  const requests = stats.userRequests?.[targetId] || 0;
+  const language = getUserLanguage(targetId);
+
+  let memberTag = `<@${targetId}>`;
+  try {
+    const member = await guild.members.fetch(targetId);
+    memberTag = member.user.tag;
+  } catch {}
+
+  const embed = new EmbedBuilder()
+    .setColor(0x9b59b6)
+    .setTitle(`👥 User Panel — ${memberTag}`)
+    .addFields(
+      { name: 'User', value: `<@${targetId}>`, inline: true },
+      { name: 'Strikes', value: `${offenses}/${threshold}`, inline: true },
+      { name: 'AI Requests', value: `${requests}`, inline: true },
+      { name: 'Language', value: language || 'Auto-detect', inline: true }
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`userpanel_resetstrikes_${targetId}`).setLabel('Reset Strikes').setStyle(ButtonStyle.Success).setEmoji('🔄'),
+    new ButtonBuilder().setCustomId(`userpanel_ban_${targetId}`).setLabel('Ban').setStyle(ButtonStyle.Danger).setEmoji('🔨'),
+    new ButtonBuilder().setCustomId(`userpanel_timeout_${targetId}`).setLabel('Timeout').setStyle(ButtonStyle.Secondary).setEmoji('🔇')
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+async function handleUserPanel(message, argText) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const targetId = extractUserId(argText);
+  if (!targetId) {
+    const row = new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder().setCustomId('userpanel_select').setPlaceholder('Select a user to view')
+    );
+    return message.reply({ content: 'Select the user you want to view:', components: [row] });
+  }
+
+  const panel = await buildUserPanelEmbed(message.guild, targetId);
+  await message.reply(panel);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /languagepanel - quick language dropdown instead of typing
+// ════════════════════════════════════════════════════════════════════════════
+async function handleLanguagePanel(message) {
+  const current = getUserLanguage(message.author.id);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle('🌍 Language Panel')
+    .setDescription(`Current: **${current || 'Auto-detect'}**\n\nPick a language below, or use Custom for anything else.`);
+
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('languagepanel_select')
+      .setPlaceholder('Choose a language')
+      .addOptions([
+        { label: 'English', value: 'English', emoji: '🇬🇧' },
+        { label: 'German', value: 'German', emoji: '🇩🇪' },
+        { label: 'Turkish', value: 'Turkish', emoji: '🇹🇷' },
+        { label: 'Spanish', value: 'Spanish', emoji: '🇪🇸' },
+        { label: 'French', value: 'French', emoji: '🇫🇷' },
+        { label: 'Italian', value: 'Italian', emoji: '🇮🇹' },
+        { label: 'Portuguese', value: 'Portuguese', emoji: '🇵🇹' },
+        { label: 'Arabic', value: 'Arabic', emoji: '🇸🇦' },
+        { label: 'Russian', value: 'Russian', emoji: '🇷🇺' },
+        { label: 'Auto-detect (Reset)', value: 'reset', emoji: '🔄' },
+        { label: 'Custom (type your own)', value: 'custom', emoji: '✏️' }
+      ])
+  );
+
+  await message.reply({ embeds: [embed], components: [row] });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /securitypanel - security-only settings, separate from the rest
+// ════════════════════════════════════════════════════════════════════════════
+async function handleSecurityPanel(message) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const settings = loadAdminSettings();
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe67e22)
+    .setTitle('🔒 Security Panel')
+    .addFields(
+      { name: 'Custom Blocked Words', value: settings.blockedWords.length ? settings.blockedWords.join(', ') : 'None', inline: false },
+      { name: 'Trusted Roles', value: settings.trustedRoleIds.length ? settings.trustedRoleIds.map(id => `<@&${id}>`).join(', ') : 'None', inline: false }
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('securitypanel_menu')
+      .setPlaceholder('Choose a security setting')
+      .addOptions([
+        { label: 'Add Blocked Word', value: 'add_word', emoji: '🚫' },
+        { label: 'Remove Blocked Word', value: 'remove_word', emoji: '🗑️' },
+        { label: 'Add Trusted Role', value: 'add_role', emoji: '👮' },
+        { label: 'Clear Trusted Roles', value: 'clear_roles', emoji: '🧹' }
+      ])
+  );
+
+  await message.reply({ embeds: [embed], components: [row] });
+}
 
 client.login(process.env.DISCORD_TOKEN);
