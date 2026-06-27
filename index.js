@@ -37,6 +37,7 @@ function saveJSON(file, data) {
 function defaultAdminSettings() {
   return {
     aiOnline: true,
+    accessPassword: '5362',
     modPermissions: { ban: false, kick: false, timeout: false, mute: false },
     timeoutDurationMinutes: 60,
     strikeThreshold: 3,
@@ -419,7 +420,8 @@ async function buildAdminSettingsPanel() {
         { label: 'Add Trusted Role', value: 'add_trusted_role', emoji: '👮' },
         { label: 'Clear Trusted Roles', value: 'clear_trusted_roles', emoji: '🧹' },
         { label: 'View Stats', value: 'view_stats', emoji: '📊' },
-        { label: 'Reset a User\'s Strikes', value: 'reset_user_strikes', emoji: '🔄' }
+        { label: 'Reset a User\'s Strikes', value: 'reset_user_strikes', emoji: '🔄' },
+        { label: 'Change Access Password', value: 'change_password', emoji: '🔑' }
       ])
   );
 
@@ -524,7 +526,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const password = interaction.fields.getTextInputValue('password_input').trim();
-    if (password !== '5362') {
+    const currentSettings = loadAdminSettings();
+    if (password !== currentSettings.accessPassword) {
       return await interaction.reply({ content: '❌ Incorrect password.', ephemeral: true });
     }
 
@@ -652,10 +655,35 @@ client.on('interactionCreate', async (interaction) => {
       const row = new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId('admin_resetstrikes_select').setPlaceholder('Select a user to reset strikes'));
       return await interaction.reply({ content: 'Select the user whose strikes you want to reset:', components: [row], ephemeral: true });
     }
+
+    if (choice === 'change_password') {
+      const modal = new ModalBuilder().setCustomId('admin_changepassword_modal').setTitle('Change Access Password');
+      const input = new TextInputBuilder()
+        .setCustomId('new_password_input')
+        .setLabel('New Password')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('Enter new password...')
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return await interaction.showModal(modal);
+    }
   }
 
-  if (interaction.isModalSubmit() && interaction.customId === 'language_modal') {
-    const language = interaction.fields.getTextInputValue('language_input');
+  if (interaction.isModalSubmit() && interaction.customId === 'admin_changepassword_modal') {
+    if (!isAdmin(interaction.member)) {
+      return await interaction.reply({ content: '❌ Only admins can use this.', ephemeral: true });
+    }
+    const newPassword = interaction.fields.getTextInputValue('new_password_input').trim();
+    if (!newPassword) {
+      return await interaction.reply({ content: '❌ Password cannot be empty.', ephemeral: true });
+    }
+    const settings = loadAdminSettings();
+    settings.accessPassword = newPassword;
+    saveAdminSettings(settings);
+    return await interaction.reply({ content: '✅ Admin access password has been changed successfully.', ephemeral: true });
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === 'language_modal') {    const language = interaction.fields.getTextInputValue('language_input');
     setUserLanguage(interaction.user.id, language);
     return await interaction.reply({ content: `✅ Your language has been set to **${language}**!`, ephemeral: true });
   }
