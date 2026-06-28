@@ -21,6 +21,8 @@ const SETTINGS_FILE = './member_settings.json';
 const ADMIN_SETTINGS_FILE = './admin_settings.json';
 const OFFENSES_FILE = './offenses.json';
 const STATS_FILE = './stats.json';
+const VIP_LEAKER_CODES_FILE = './vip_leaker_codes.json';
+const UPDATES_FILE = './updates.json';
 
 const conversations = new Map();
 const pendingPings = new Map();
@@ -92,6 +94,39 @@ function trackUsage(userId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// VIP Leaker: weekly free code claim
+// ════════════════════════════════════════════════════════════════════════════
+function loadVIPLeakerClaims() { return loadJSON(VIP_LEAKER_CODES_FILE, {}); }
+function saveVIPLeakerClaims(data) { saveJSON(VIP_LEAKER_CODES_FILE, data); }
+
+function generateGiftCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  for (let i = 0; i < 16; i++) {
+    if (i > 0 && i % 4 === 0) code += '-';
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function getNextClaimTime(lastClaimISO) {
+  const last = new Date(lastClaimISO).getTime();
+  return last + 7 * 24 * 60 * 60 * 1000; // 7 days
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// VIP Leaker: early access updates
+// ════════════════════════════════════════════════════════════════════════════
+function loadUpdates() { return loadJSON(UPDATES_FILE, []); }
+function saveUpdates(data) { saveJSON(UPDATES_FILE, data); }
+function addUpdate(title, content, authorId) {
+  const updates = loadUpdates();
+  updates.unshift({ title, content, authorId, postedAt: new Date().toISOString() });
+  if (updates.length > 25) updates.length = 25;
+  saveUpdates(updates);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // PERMISSIONS
 // ════════════════════════════════════════════════════════════════════════════
 function isAdmin(member) {
@@ -105,6 +140,20 @@ function isAdmin(member) {
   const roles = member.roles?.cache;
   if (!roles) return false;
   return settings.trustedRoleIds.some(roleId => roles.has(roleId));
+}
+
+function isVIP(member) {
+  if (!process.env.VIP_ROLE_ID) return false;
+  const roles = member.roles?.cache;
+  if (!roles) return false;
+  return roles.has(process.env.VIP_ROLE_ID) || isAdmin(member);
+}
+
+function isVIPLeaker(member) {
+  if (!process.env.VIP_LEAKER_ROLE_ID) return false;
+  const roles = member.roles?.cache;
+  if (!roles) return false;
+  return roles.has(process.env.VIP_LEAKER_ROLE_ID) || isAdmin(member);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -217,12 +266,61 @@ Keep responses concise and to the point - this is Discord, not an essay.`;
 // ════════════════════════════════════════════════════════════════════════════
 // /ai HANDLER
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// VIP Coding Mode - exclusive Roblox Studio / Lua coding help
+// ════════════════════════════════════════════════════════════════════════════
+const VIP_CODING_PROMPT = `You are Bikkini AI in VIP Coding Mode, an expert Roblox Studio and Lua/Luau scripting assistant.
+You give precise, high-quality, production-ready code for Roblox Studio.
+Always use proper Luau syntax, follow Roblox best practices (e.g. using RemoteEvents correctly, avoiding exploits, using :Connect() properly, proper service usage like game:GetService()).
+When giving code, wrap it in \`\`\`lua code blocks.
+Explain briefly what the script does after the code.
+Be thorough and accurate - this is a premium feature for VIP members, so give your best possible answer.`;
+
+async function handleVIPCoding(message, prompt) {
+  if (!prompt) {
+    return message.reply('👑 **VIP Coding Mode** — Ask me anything about Roblox Studio scripting!\nExample: `?ai vip how do I make a leaderboard with DataStore?`');
+  }
+
+  await message.channel.sendTyping();
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: VIP_CODING_PROMPT },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 2048,
+      temperature: 0.3
+    });
+
+    const reply = response.choices[0].message.content;
+    const safeReply = reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
+
+    const header = '👑 **VIP Coding Mode**\n\n';
+    const full = header + safeReply;
+
+    if (full.length <= 1900) {
+      await message.reply({ content: full, allowedMentions: { parse: ['users'] } });
+    } else {
+      await message.reply({ content: header, allowedMentions: { parse: [] } });
+      const chunks = safeReply.match(/.{1,1900}/gs);
+      for (const chunk of chunks) await message.channel.send({ content: chunk, allowedMentions: { parse: ['users'] } });
+    }
+  } catch (err) {
+    console.error('[VIP CODING ERROR]', err);
+    await message.reply('❌ Something went wrong. Please try again.');
+  }
+}
+
 async function handleAI(message, prompt) {
   const adminSettings = loadAdminSettings();
   const userIsAdmin = isAdmin(message.member);
+  const userIsVIP = isVIP(message.member);
 
-  if (!adminSettings.aiOnline) {
-    return message.reply({ content: '🔴 Bikkini AI is currently offline (turned off by an Admin).', allowedMentions: { parse: [] } });
+  // VIPs can still use the AI even when it's turned off for everyone else
+  if (!adminSettings.aiOnline && !userIsVIP) {
+    return message.reply({ content: '🔴 Bikkini AI is currently offline (turned off by an Admin). 👑 VIP members can still use it.', allowedMentions: { parse: [] } });
   }
 
   if (adminSettings.restrictedChannelIds.length > 0 && !adminSettings.restrictedChannelIds.includes(message.channel.id) && !userIsAdmin) {
@@ -244,6 +342,14 @@ async function handleAI(message, prompt) {
 
   if (!prompt) {
     return message.reply('❓ Please write something after `?ai` — for example: `?ai how are you?`');
+  }
+
+  // VIP exclusive coding mode: ?ai vip <question>
+  if (prompt.toLowerCase().startsWith('vip ')) {
+    if (!userIsVIP) {
+      return message.reply({ content: '👑 The `?ai vip` coding mode is exclusive to VIP members.', allowedMentions: { parse: [] } });
+    }
+    return await handleVIPCoding(message, prompt.slice(4).trim());
   }
 
   if (containsOffensiveLanguage(prompt)) {
@@ -320,16 +426,19 @@ async function handleAI(message, prompt) {
     ? `\nIMPORTANT: This user has set their preferred language to "${userLanguage}". ALWAYS respond in that language.`
     : `\nVERY IMPORTANT: Always detect the language the user is writing in and respond in that EXACT same language.`;
 
+  // VIPs get a faster, smaller model for quicker responses
+  const modelToUse = userIsVIP ? 'llama-3.1-8b-instant' : 'llama-3.3-70b-versatile';
+
   try {
     const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: modelToUse,
       messages: [{ role: 'system', content: systemPrompt }, ...history],
       max_tokens: 1024
     });
 
     const reply = response.choices[0].message.content;
     history.push({ role: 'assistant', content: reply });
-    const safeReply = reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
+    const safeReply = (userIsVIP ? '⚡ ' : '') + reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
 
     if (safeReply.length <= 1900) {
       await message.reply({ content: safeReply, allowedMentions: { parse: ['users'] } });
@@ -451,6 +560,9 @@ function handleHelp(message) {
   message.reply([
     '**🤖 Bikkini AI – Commands**', '',
     '`?ai <question>` – Ask Bikkini AI anything',
+    '`?ai vip <question>` – 👑 VIP-exclusive Roblox Studio coding help',
+    '`?ai claimcode` – 👑 VIP Leaker: claim your weekly free VIP gift code',
+    '`?ai updates` – 👑 VIP Leaker: view early access updates',
     '`?ai membersettings` – Manage your personal settings',
     '`?ai languagepanel` – Quick language selector',
     '`?ai adminsettings` – Admin controls (Admin only)',
@@ -497,6 +609,9 @@ client.on('messageCreate', async (message) => {
     if (sub === 'userpanel') return await handleUserPanel(message, args.slice(1).join(' '));
     if (sub === 'languagepanel') return await handleLanguagePanel(message);
     if (sub === 'securitypanel') return await handleSecurityPanel(message);
+    if (sub === 'claimcode') return await handleClaimCode(message);
+    if (sub === 'updates') return await handleUpdates(message);
+    if (sub === 'postupdate') return await handlePostUpdate(message, args.slice(1).join(' '));
     return await handleAI(message, args.join(' '));
   }
 
@@ -1089,6 +1204,108 @@ async function handleSecurityPanel(message) {
   );
 
   await message.reply({ embeds: [embed], components: [row] });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /ai claimcode - VIP Leaker weekly free VIP code
+// ════════════════════════════════════════════════════════════════════════════
+async function handleClaimCode(message) {
+  if (!isVIPLeaker(message.member)) {
+    return message.reply({ content: '👑 This command is exclusive to **VIP Leaker** members.', allowedMentions: { parse: [] } });
+  }
+
+  const claims = loadVIPLeakerClaims();
+  const userId = message.author.id;
+  const lastClaim = claims[userId]?.lastClaimedAt;
+
+  if (lastClaim) {
+    const nextClaimTime = getNextClaimTime(lastClaim);
+    if (Date.now() < nextClaimTime) {
+      const remaining = nextClaimTime - Date.now();
+      const days = Math.floor(remaining / 86400000);
+      const hours = Math.floor((remaining % 86400000) / 3600000);
+      return message.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0xe67e22)
+          .setTitle('⏳ Already Claimed')
+          .setDescription(`You already claimed your free VIP code this week.\n\nYou can claim a new one in **${days}d ${hours}h**.`)],
+        allowedMentions: { parse: [] }
+      });
+    }
+  }
+
+  const code = generateGiftCode();
+  claims[userId] = { lastClaimedAt: new Date().toISOString(), lastCode: code };
+  saveVIPLeakerClaims(claims);
+
+  await message.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x9b59b6)
+      .setTitle('🎁 Your Weekly VIP Code')
+      .setDescription(`Here is your free VIP gift code! Give it to anyone you want to give VIP.\n\n\`\`\`${code}\`\`\``)
+      .setFooter({ text: 'You can claim a new one again in 7 days.' })
+      .setTimestamp()],
+    allowedMentions: { parse: [] }
+  });
+
+  console.log(`[VIP LEAKER] ${message.author.tag} claimed weekly gift code: ${code}`);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /ai updates - VIP Leaker early access updates
+// ════════════════════════════════════════════════════════════════════════════
+async function handleUpdates(message) {
+  if (!isVIPLeaker(message.member)) {
+    return message.reply({ content: '👑 Early access updates are exclusive to **VIP Leaker** members.', allowedMentions: { parse: [] } });
+  }
+
+  const updates = loadUpdates();
+  if (updates.length === 0) {
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('📢 Early Access Updates').setDescription('No updates posted yet. Check back soon!')] });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x3498db)
+    .setTitle('📢 Early Access Updates')
+    .setFooter({ text: '👑 Exclusive to VIP Leaker members' });
+
+  for (const update of updates.slice(0, 5)) {
+    embed.addFields({
+      name: `${update.title} — <t:${Math.floor(new Date(update.postedAt).getTime() / 1000)}:R>`,
+      value: update.content
+    });
+  }
+
+  await message.reply({ embeds: [embed] });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// /ai postupdate - Admin posts a new early access update
+// ════════════════════════════════════════════════════════════════════════════
+async function handlePostUpdate(message, argText) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can post updates.', allowedMentions: { parse: [] } });
+  }
+
+  if (!argText) {
+    return message.reply('Usage: `?ai postupdate Title | Content goes here`');
+  }
+
+  const [title, ...rest] = argText.split('|');
+  const content = rest.join('|').trim();
+
+  if (!content) {
+    return message.reply('Usage: `?ai postupdate Title | Content goes here` (separate title and content with `|`)');
+  }
+
+  addUpdate(title.trim(), content, message.author.id);
+
+  await message.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle('✅ Update Posted')
+      .setDescription(`Posted to VIP Leaker early access feed:\n\n**${title.trim()}**\n${content}`)]
+  });
 }
 
 client.login(process.env.DISCORD_TOKEN);
