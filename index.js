@@ -440,7 +440,7 @@ async function handleAI(message, prompt) {
 
     const reply = response.choices[0].message.content;
     history.push({ role: 'assistant', content: reply });
-    const safeReply = (userIsVIP ? '⚡ ' : '') + reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
+    const safeReply = reply.replace(/@everyone/gi, '@\u200beveryone').replace(/@here/gi, '@\u200bhere');
 
     if (safeReply.length <= 1900) {
       await message.reply({ content: safeReply, allowedMentions: { parse: ['users'] } });
