@@ -414,7 +414,11 @@ async function handleAI(message, prompt) {
   trackUsage(message.author.id);
   const userId = message.author.id;
   // VIPs skip the "typing..." indicator so the response feels instant
-  if (!userIsVIP) await message.channel.sendTyping();
+  // VIPs skip the "typing..." indicator so the response feels instant
+  if (!userIsVIP) {
+    await message.channel.sendTyping();
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
 
   if (!conversations.has(userId)) conversations.set(userId, []);
   const history = conversations.get(userId);
