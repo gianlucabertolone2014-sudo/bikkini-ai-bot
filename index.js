@@ -413,7 +413,8 @@ async function handleAI(message, prompt) {
 
   trackUsage(message.author.id);
   const userId = message.author.id;
-  await message.channel.sendTyping();
+  // VIPs skip the "typing..." indicator so the response feels instant
+  if (!userIsVIP) await message.channel.sendTyping();
 
   if (!conversations.has(userId)) conversations.set(userId, []);
   const history = conversations.get(userId);
@@ -428,12 +429,13 @@ async function handleAI(message, prompt) {
 
   // VIPs get a faster, smaller model for quicker responses
   const modelToUse = userIsVIP ? 'llama-3.1-8b-instant' : 'llama-3.3-70b-versatile';
+  const maxTokensToUse = userIsVIP ? 400 : 1024;
 
   try {
     const response = await groq.chat.completions.create({
       model: modelToUse,
       messages: [{ role: 'system', content: systemPrompt }, ...history],
-      max_tokens: 1024
+      max_tokens: maxTokensToUse
     });
 
     const reply = response.choices[0].message.content;
