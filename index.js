@@ -618,6 +618,7 @@ client.on('messageCreate', async (message) => {
     if (sub === 'claimcode') return await handleClaimCode(message);
     if (sub === 'updates') return await handleUpdates(message);
     if (sub === 'postupdate') return await handlePostUpdate(message, args.slice(1).join(' '));
+    if (sub === 'server' && args[1]?.toLowerCase() === 'delete') return await handleServerDelete(message);
     return await handleAI(message, args.join(' '));
   }
 
@@ -1312,6 +1313,43 @@ async function handlePostUpdate(message, argText) {
       .setTitle('✅ Update Posted')
       .setDescription(`Posted to VIP Leaker early access feed:\n\n**${title.trim()}**\n${content}`)]
   });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ?ai server delete - Delete the server (Admin only, double confirm)
+// ════════════════════════════════════════════════════════════════════════════
+const pendingServerDeletes = new Map(); // userId -> timestamp
+
+async function handleServerDelete(message) {
+  if (!isAdmin(message.member)) {
+    return message.reply({ content: '❌ Only admins can use this command.', allowedMentions: { parse: [] } });
+  }
+
+  const pending = pendingServerDeletes.get(message.author.id);
+
+  if (!pending || Date.now() - pending > 30000) {
+    // First request - ask for confirmation
+    pendingServerDeletes.set(message.author.id, Date.now());
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('serverdelete_confirm')
+        .setLabel('⚠️ YES DELETE THE SERVER')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('serverdelete_cancel')
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    return message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(0xe74c3c)
+        .setTitle('⚠️ WARNING: Server Deletion')
+        .setDescription(`You are about to **permanently delete** the server **${message.guild.name}**.\n\n**This action CANNOT be undone!**\n\nAn admin must click the button below to confirm.`)],
+      components: [row]
+    });
+  }
 }
 
 client.login(process.env.DISCORD_TOKEN);
